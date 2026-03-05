@@ -1,0 +1,72 @@
+# =============================================================================
+# Link Prediction with GAT on ogbl-collab - Default Configuration
+# =============================================================================
+
+# Dataset
+dataset:
+  name: ogbl-collab
+  root: ./dataset
+  use_valedges_as_input: true
+
+# Model - GAT Encoder
+model:
+  num_layers: 3
+  hidden_channels: 256
+  heads: 4
+  dropout: 0.3
+  attn_dropout: 0.1
+  use_gatv2: true
+  residual: true
+  layer_norm: true
+  jk_mode: cat            # Jumping Knowledge: cat, max, lstm, last
+
+# Model - Node Embedding
+node_embedding:
+  use_embedding: true
+  embedding_dim: 256
+
+# Model - Link Predictor
+predictor:
+  num_layers: 3
+  hidden_channels: 256
+  dropout: 0.3
+
+# Training
+training:
+  epochs: 400
+  batch_size: 65536        # 64K
+  lr: 0.001
+  weight_decay: 0.0
+  grad_clip: 1.0
+  neg_sampling_ratio: 1.0
+
+# LR Scheduler
+scheduler:
+  type: cosine             # cosine, step, plateau
+  warmup_epochs: 10
+  min_lr: 0.00001
+
+# Evaluation
+evaluation:
+  eval_steps: 10
+  metrics:
+    - hits@10
+    - hits@50
+    - hits@100
+
+# Early Stopping
+early_stopping:
+  enabled: true
+  patience: 50
+  monitor: hits@50
+  mode: max
+
+# Experiment
+experiment:
+  runs: 3
+  seed: 42
+  device: 0
+  log_steps: 1
+  save_checkpoints: true
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs
