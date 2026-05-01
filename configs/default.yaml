@@ -1,6 +1,5 @@
-# Default high-capacity CUDA configuration for an Nvidia RTX 5070 Ti class GPU.
-# The desktop RTX 5070 Ti is commonly a 16 GB GDDR7 card, so this config aims
-# for strong results without assuming 24 GB+ workstation memory.
+# Default high-capacity CUDA configuration for ogbl-collab link prediction.
+# Tune batch size and hidden dimensions for the available GPU memory.
 
 dataset:
   name: ogbl-collab
@@ -84,5 +83,5 @@ experiment:
   matmul_precision: high
   log_steps: 2
   save_checkpoints: true
-  checkpoint_dir: checkpoints/rtx5070ti
-  log_dir: logs/rtx5070ti
+  checkpoint_dir: checkpoints/default
+  log_dir: logs/default

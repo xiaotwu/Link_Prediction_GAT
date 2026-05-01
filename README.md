@@ -7,8 +7,7 @@ uv venv --python 3.11 .venv
 uv pip install -r requirements.txt
 ```
 
-The only configuration file is `configs/default.yaml`. It targets an Nvidia RTX
-5070 Ti CUDA GPU.
+The only configuration file is `configs/default.yaml`. It targets CUDA training.
 
 If CUDA memory is tight, first reduce `training.batch_size`, then reduce
 `model.hidden_channels`.
@@ -40,9 +39,9 @@ Validation and test evaluation run automatically during training:
 Artifacts:
 
 ```text
-checkpoints/rtx5070ti/best_run*.pt
-logs/rtx5070ti/training_log.json
-logs/rtx5070ti/config_used.yaml
+checkpoints/default/best_run*.pt
+logs/default/training_log.json
+logs/default/config_used.yaml
 ```
 
 To validate the structural heuristic baseline independently:
