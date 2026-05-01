@@ -7,11 +7,11 @@ uv venv --python 3.11 .venv
 uv pip install -r requirements.txt
 ```
 
-The default configuration targets an Nvidia RTX 5070 Ti CUDA GPU:
+The only configuration file is `configs/default.yaml`. It targets an Nvidia RTX
+5070 Ti CUDA GPU.
 
-```text
-configs/default.yaml
-```
+If CUDA memory is tight, first reduce `training.batch_size`, then reduce
+`model.hidden_channels`.
 
 ## Train
 
@@ -29,8 +29,13 @@ uv run python scripts/train.py --batch-size 131072
 
 ## Validate And Test
 
-Validation and test evaluation run automatically during training with the OGB
-fixed negative edges. The monitored metric is `Hits@50`.
+Validation and test evaluation run automatically during training:
+
+- evaluation uses the official OGB fixed negative edges
+- validation monitors `Hits@50`
+- test scores are reported at the best validation checkpoint
+- epoch `0` is evaluated first so the structural AA/RA prior is checkpointed
+  before neural training starts
 
 Artifacts:
 
@@ -40,7 +45,7 @@ logs/rtx5070ti/training_log.json
 logs/rtx5070ti/config_used.yaml
 ```
 
-To verify structural heuristic baselines:
+To validate the structural heuristic baseline independently:
 
 ```bash
 uv run python scripts/evaluate_heuristics.py
@@ -53,6 +58,8 @@ After validation/test verification completes, the best result is appended to:
 ```text
 results/results.csv
 ```
+
+The file is intentionally kept as a separate results sheet:
 
 | Method | Ext. data | Test Hits@50 | Validation Hits@50 | #Params | Hardware | Date |
 |---|---|---:|---:|---:|---|---|
