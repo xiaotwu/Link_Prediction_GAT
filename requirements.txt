@@ -1,32 +1,13 @@
-# Core dependencies
-torch==2.7.1+cu128
-torchvision==0.22.1+cu128
-torchaudio==2.7.1+cu128
-torch-geometric==2.6.1
-torch_sparse==0.6.18+pt27cu128
-torch_scatter==2.1.2+pt27cu128
-torch_cluster==1.6.3+pt27cu128
-torch_spline_conv==1.2.2+pt27cu128
-pyg_lib==0.4.0+pt27cu128
-
-# Graph benchmark
-ogb==1.3.6
-
-# Scientific computing
-numpy==2.1.2
-scipy==1.16.0
-scikit-learn==1.7.0
-pandas==2.3.0
-networkx==3.3
-
-# Visualization
-matplotlib==3.10.3
-seaborn>=0.13.0
-
-# Utilities
-tqdm==4.67.1
+torch>=2.3
+torch-geometric>=2.6
+ogb>=1.3.6
+numpy>=1.24
+scipy>=1.10
+pandas>=2.0
+scikit-learn>=1.3
 pyyaml>=6.0
-
-# Notebook support
+tqdm>=4.66
+matplotlib>=3.8
+seaborn>=0.13
 jupyter>=1.0
 ipykernel>=6.0

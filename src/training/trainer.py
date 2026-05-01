@@ -1,73 +1,161 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
+
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from torch_geometric.data import Data
+
+from src.models import LinkPredictionGAT, LinkPredictor
+from src.training.sampling import NegativeSampler
+from src.training.structural import StructuralFeatureStore
 
 
-def train_epoch(model, predictor, data, split_edge, optimizer,
-                batch_size, node_emb=None):
-    """Run one training epoch with improved negative sampling."""
+def train_epoch(
+    model: LinkPredictionGAT,
+    predictor: LinkPredictor,
+    data: Data,
+    split_edge: dict[str, dict[str, torch.Tensor]],
+    optimizer: torch.optim.Optimizer,
+    batch_size: int,
+    negative_sampler: NegativeSampler,
+    grad_clip: float | None = 1.0,
+    encode_once: bool = False,
+    structural_features: StructuralFeatureStore | None = None,
+) -> float:
+    """Train for one epoch.
+
+    The default path mirrors the official OGB full-batch GNN baseline: each
+    edge mini-batch gets a fresh graph encoding and an optimizer step.  The
+    optional ``encode_once`` mode computes the graph encoding once and performs
+    a single optimizer step per epoch; it is faster but changes the optimizer
+    schedule, so it is opt-in.
+    """
     model.train()
     predictor.train()
 
-    pos_train_edge = split_edge["train"]["edge"].to(data.x.device)
+    pos_train_edge = split_edge["train"]["edge"]
+    loader = DataLoader(
+        range(pos_train_edge.size(0)),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+    )
 
-    total_loss = total_examples = 0
-    loader = DataLoader(range(pos_train_edge.size(0)), batch_size, shuffle=True)
-
-    for perm in loader:
-        optimizer.zero_grad()
-
-        # Build input features
-        x = data.x
-        if node_emb is not None:
-            x = x + node_emb.weight
-
-        h = model(x, data.adj_t)
-
-        # Positive edges
-        edge = pos_train_edge[perm].t()
-        pos_out = predictor(h[edge[0]], h[edge[1]])
-        pos_loss = -torch.log(pos_out + 1e-15).mean()
-
-        # Hard negative sampling: mix random negatives with degree-biased negatives
-        num_neg = edge.size(1)
-        num_random = num_neg // 2
-        num_degree = num_neg - num_random
-
-        # Random negatives
-        neg_random = torch.randint(
-            0, data.num_nodes, (2, num_random),
-            dtype=torch.long, device=h.device
+    if encode_once:
+        return _train_epoch_encode_once(
+            model,
+            predictor,
+            data,
+            pos_train_edge,
+            optimizer,
+            loader,
+            negative_sampler,
+            grad_clip,
+            structural_features,
         )
 
-        # Degree-biased negatives (higher-degree nodes are harder negatives)
-        if num_degree > 0:
-            deg = data.adj_t.sum(dim=1).to(torch.float)
-            deg_prob = deg / deg.sum()
-            deg_idx = torch.multinomial(
-                deg_prob, num_degree * 2, replacement=True
-            )
-            neg_degree = deg_idx.view(2, num_degree)
-        else:
-            neg_degree = torch.zeros(
-                (2, 0), dtype=torch.long, device=h.device
-            )
-
-        neg_edge = torch.cat([neg_random, neg_degree], dim=1)
-        neg_out = predictor(h[neg_edge[0]], h[neg_edge[1]])
-        neg_loss = -torch.log(1 - neg_out + 1e-15).mean()
-
-        loss = pos_loss + neg_loss
+    total_loss = 0.0
+    total_examples = 0
+    for perm in loader:
+        optimizer.zero_grad(set_to_none=True)
+        h = model.encode(data.x, data.train_edge_index, data.train_edge_attr)
+        loss, examples = _batch_loss(
+            predictor=predictor,
+            h=h,
+            pos_edge=pos_train_edge[perm].to(h.device).t(),
+            negative_sampler=negative_sampler,
+            structural_features=structural_features,
+        )
         loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        torch.nn.utils.clip_grad_norm_(predictor.parameters(), 1.0)
-        if node_emb is not None:
-            torch.nn.utils.clip_grad_norm_(node_emb.parameters(), 1.0)
-
+        _clip_gradients(model, predictor, grad_clip)
         optimizer.step()
 
-        num_examples = pos_out.size(0)
-        total_loss += loss.item() * num_examples
-        total_examples += num_examples
+        total_loss += loss.item() * examples
+        total_examples += examples
 
-    return total_loss / total_examples
+    return total_loss / max(total_examples, 1)
+
+
+def _train_epoch_encode_once(
+    model: LinkPredictionGAT,
+    predictor: LinkPredictor,
+    data: Data,
+    pos_train_edge: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    loader: Iterable[torch.Tensor],
+    negative_sampler: NegativeSampler,
+    grad_clip: float | None,
+    structural_features: StructuralFeatureStore | None,
+) -> float:
+    optimizer.zero_grad(set_to_none=True)
+    h = model.encode(data.x, data.train_edge_index, data.train_edge_attr)
+
+    batches = list(loader)
+    total_loss = 0.0
+    total_examples = 0
+    total_edges = pos_train_edge.size(0)
+
+    for index, perm in enumerate(batches):
+        loss, examples = _batch_loss(
+            predictor=predictor,
+            h=h,
+            pos_edge=pos_train_edge[perm].to(h.device).t(),
+            negative_sampler=negative_sampler,
+            structural_features=structural_features,
+        )
+        weighted_loss = loss * (examples / total_edges)
+        weighted_loss.backward(retain_graph=index + 1 < len(batches))
+        total_loss += loss.item() * examples
+        total_examples += examples
+
+    _clip_gradients(model, predictor, grad_clip)
+    optimizer.step()
+    return total_loss / max(total_examples, 1)
+
+
+def _batch_loss(
+    predictor: LinkPredictor,
+    h: torch.Tensor,
+    pos_edge: torch.Tensor,
+    negative_sampler: NegativeSampler,
+    structural_features: StructuralFeatureStore | None = None,
+) -> tuple[torch.Tensor, int]:
+    neg_edge = negative_sampler.sample(pos_edge.size(1), h.device)
+    pos_edge_features = _edge_features(structural_features, pos_edge, h.device)
+    neg_edge_features = _edge_features(structural_features, neg_edge, h.device)
+
+    pos_logits = predictor(h[pos_edge[0]], h[pos_edge[1]], pos_edge_features)
+    neg_logits = predictor(h[neg_edge[0]], h[neg_edge[1]], neg_edge_features)
+
+    pos_loss = F.binary_cross_entropy_with_logits(
+        pos_logits,
+        torch.ones_like(pos_logits),
+    )
+    neg_loss = F.binary_cross_entropy_with_logits(
+        neg_logits,
+        torch.zeros_like(neg_logits),
+    )
+    return pos_loss + neg_loss, pos_logits.numel()
+
+
+def _edge_features(
+    structural_features: StructuralFeatureStore | None,
+    edge: torch.Tensor,
+    device: torch.device,
+) -> torch.Tensor | None:
+    if structural_features is None:
+        return None
+    return structural_features.edge_features(edge, device=device)
+
+
+def _clip_gradients(
+    model: LinkPredictionGAT,
+    predictor: LinkPredictor,
+    grad_clip: float | None,
+) -> None:
+    if grad_clip is None or grad_clip <= 0:
+        return
+    parameters = list(model.parameters()) + list(predictor.parameters())
+    torch.nn.utils.clip_grad_norm_(parameters, grad_clip)

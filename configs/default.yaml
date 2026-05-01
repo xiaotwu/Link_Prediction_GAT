@@ -1,72 +1,88 @@
-# =============================================================================
-# Link Prediction with GAT on ogbl-collab - Default Configuration
-# =============================================================================
+# Default high-capacity CUDA configuration for an Nvidia RTX 5070 Ti class GPU.
+# The desktop RTX 5070 Ti is commonly a 16 GB GDDR7 card, so this config aims
+# for strong results without assuming 24 GB+ workstation memory.
 
-# Dataset
 dataset:
   name: ogbl-collab
-  root: ./dataset
+  root: dataset
   use_valedges_as_input: true
+  normalize_node_features: true
+  add_degree_features: true
+  use_edge_features: true
+  add_self_loops: true
+  self_loop_fill_value: 0.0
 
-# Model - GAT Encoder
 model:
+  gat_type: gatv2
   num_layers: 3
+  feature_channels: 256
+  node_embedding_channels: 256
   hidden_channels: 256
+  out_channels: 256
   heads: 4
-  dropout: 0.3
-  attn_dropout: 0.1
-  use_gatv2: true
+  dropout: 0.25
+  input_dropout: 0.1
+  attention_dropout: 0.1
   residual: true
-  layer_norm: true
-  jk_mode: cat            # Jumping Knowledge: cat, max, lstm, last
+  norm: layer
+  jk: cat
 
-# Model - Node Embedding
-node_embedding:
-  use_embedding: true
-  embedding_dim: 256
-
-# Model - Link Predictor
 predictor:
-  num_layers: 3
-  hidden_channels: 256
-  dropout: 0.3
+  num_layers: 5
+  hidden_channels: 512
+  dropout: 0.25
+  batch_norm: true
+  zero_output: true
 
-# Training
+structural_features:
+  enabled: true
+  features: [cn, aa, ra, jaccard, pa]
+  skip_weights: [0.0, 1.0, 1.0, 0.0, 0.0]
+
 training:
-  epochs: 400
-  batch_size: 65536        # 64K
-  lr: 0.001
-  weight_decay: 0.0
+  epochs: 300
+  batch_size: 262144
+  lr: 0.0005
+  weight_decay: 0.00001
   grad_clip: 1.0
-  neg_sampling_ratio: 1.0
+  neg_sampling_ratio: 2.0
+  negative_sampler: mixed
+  degree_negative_fraction: 0.75
+  encode_once_per_epoch: false
 
-# LR Scheduler
 scheduler:
-  type: cosine             # cosine, step, plateau
+  type: cosine
   warmup_epochs: 10
-  min_lr: 0.00001
+  min_lr: 0.000005
 
-# Evaluation
 evaluation:
-  eval_steps: 10
-  metrics:
-    - hits@10
-    - hits@50
-    - hits@100
+  eval_steps: 2
+  batch_size: 262144
+  metrics: [10, 50, 100]
+  max_train_edges: 250000
+  use_full_graph_for_test: true
+  eval_at_start: true
 
-# Early Stopping
 early_stopping:
   enabled: true
-  patience: 50
+  patience: 40
   monitor: hits@50
-  mode: max
 
-# Experiment
+result_sheet:
+  path: results/results.csv
+  method: GATv2 + structural AA/RA skip
+  external_data: "No"
+  hardware: Nvidia RTX 5070 Ti
+
 experiment:
   runs: 3
   seed: 42
+  deterministic: false
+  accelerator: cuda
   device: 0
-  log_steps: 1
+  allow_tf32: true
+  matmul_precision: high
+  log_steps: 2
   save_checkpoints: true
-  checkpoint_dir: ./checkpoints
-  log_dir: ./logs
+  checkpoint_dir: checkpoints/rtx5070ti
+  log_dir: logs/rtx5070ti

@@ -1,271 +1,471 @@
-"""
-Main training script for Link Prediction with GAT on ogbl-collab.
-
-Usage:
-    python scripts/train.py
-    python scripts/train.py --config configs/default.yaml
-    python scripts/train.py --config configs/default.yaml --epochs 200 --lr 0.0005
-"""
+#!/usr/bin/env python3
+from __future__ import annotations
 
 import argparse
+import copy
+import csv
+from datetime import datetime
+import math
 import os
 import sys
-import json
-import math
+from pathlib import Path
+from typing import Any
 
-import yaml
 import torch
+import yaml
 from ogb.linkproppred import Evaluator
-from tqdm import trange, tqdm
+from tqdm import trange
 
-# Add project root to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.models import GATEncoder, LinkPredictor
-from src.data import load_dataset, prepare_features
-from src.training import train_epoch, evaluate
+from src.data import load_dataset
+from src.models import LinkPredictionGAT, LinkPredictor
+from src.training import NegativeSampler, StructuralFeatureStore, evaluate, train_epoch
 from src.utils import Logger, set_seed
 
 
-def load_config(config_path):
-    with open(config_path, "r") as f:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="GAT link prediction on ogbl-collab")
+    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--device", type=int, default=None)
+    parser.add_argument("--accelerator", choices=["auto", "cpu", "cuda", "mps"], default=None)
+    parser.add_argument("--runs", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--eval-steps", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--hidden-channels", type=int, default=None)
+    parser.add_argument("--heads", type=int, default=None)
+    parser.add_argument("--dropout", type=float, default=None)
+    parser.add_argument("--no-valedges-as-input", action="store_true")
+    parser.add_argument("--encode-once", action="store_true")
+    parser.add_argument("--no-checkpoints", action="store_true")
+    return parser.parse_args()
+
+
+def load_config(path: str | os.PathLike[str]) -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs,
-                                     min_lr=1e-5):
-    """Cosine annealing LR scheduler with linear warmup."""
-    base_lr = optimizer.param_groups[0]["lr"]
+def apply_overrides(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    cfg = copy.deepcopy(cfg)
+    if args.device is not None:
+        cfg["experiment"]["device"] = args.device
+    if args.accelerator is not None:
+        cfg["experiment"]["accelerator"] = args.accelerator
+    if args.runs is not None:
+        cfg["experiment"]["runs"] = args.runs
+    if args.epochs is not None:
+        cfg["training"]["epochs"] = args.epochs
+    if args.eval_steps is not None:
+        cfg["evaluation"]["eval_steps"] = args.eval_steps
+    if args.batch_size is not None:
+        cfg["training"]["batch_size"] = args.batch_size
+    if args.lr is not None:
+        cfg["training"]["lr"] = args.lr
+    if args.hidden_channels is not None:
+        cfg["model"]["hidden_channels"] = args.hidden_channels
+    if args.heads is not None:
+        cfg["model"]["heads"] = args.heads
+    if args.dropout is not None:
+        cfg["model"]["dropout"] = args.dropout
+        cfg["predictor"]["dropout"] = args.dropout
+    if args.no_valedges_as_input:
+        cfg["dataset"]["use_valedges_as_input"] = False
+    if args.encode_once:
+        cfg["training"]["encode_once_per_epoch"] = True
+    if args.no_checkpoints:
+        cfg["experiment"]["save_checkpoints"] = False
+    return cfg
 
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return epoch / max(1, warmup_epochs)
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        return max(min_lr / base_lr, 0.5 * (1 + math.cos(math.pi * progress)))
 
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+def build_model(
+    cfg: dict[str, Any],
+    data,
+    edge_feature_channels: int = 0,
+) -> tuple[LinkPredictionGAT, LinkPredictor]:
+    model_cfg = cfg["model"]
+    predictor_cfg = cfg["predictor"]
+    edge_dim = int(getattr(data, "edge_attr_dim", 0)) or None
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Link Prediction with GAT")
-    parser.add_argument("--config", type=str, default="configs/default.yaml")
-    # Allow CLI overrides for key hyperparameters
-    parser.add_argument("--epochs", type=int, default=None)
-    parser.add_argument("--lr", type=float, default=None)
-    parser.add_argument("--hidden_channels", type=int, default=None)
-    parser.add_argument("--heads", type=int, default=None)
-    parser.add_argument("--runs", type=int, default=None)
-    parser.add_argument("--device", type=int, default=None)
-    cli_args = parser.parse_args()
-
-    # Load config
-    cfg = load_config(cli_args.config)
-
-    # Apply CLI overrides
-    if cli_args.epochs is not None:
-        cfg["training"]["epochs"] = cli_args.epochs
-    if cli_args.lr is not None:
-        cfg["training"]["lr"] = cli_args.lr
-    if cli_args.hidden_channels is not None:
-        cfg["model"]["hidden_channels"] = cli_args.hidden_channels
-    if cli_args.heads is not None:
-        cfg["model"]["heads"] = cli_args.heads
-    if cli_args.runs is not None:
-        cfg["experiment"]["runs"] = cli_args.runs
-    if cli_args.device is not None:
-        cfg["experiment"]["device"] = cli_args.device
-
-    # Setup
-    set_seed(cfg["experiment"]["seed"])
-    device_id = cfg["experiment"]["device"]
-    device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-
-    # Load data
-    print("Loading dataset...")
-    data, split_edge, dataset = load_dataset(cfg)
-    data = prepare_features(data, cfg, device)
-    print(f"Nodes: {data.num_nodes}, Features: {data.x.size(1)}")
-
-    # Model config
-    mcfg = cfg["model"]
-    pcfg = cfg["predictor"]
-    in_channels = data.x.size(-1)
-    emb_dim = cfg["node_embedding"]["embedding_dim"]
-
-    # If using learnable node embeddings, we use a linear projection to
-    # map structural features to embedding dim, then add learnable embeddings.
-    # The projection is a fixed (non-learned) layer applied once.
-    if cfg["node_embedding"]["use_embedding"]:
-        feature_proj = torch.nn.Linear(in_channels, emb_dim, bias=False).to(device)
-        torch.nn.init.xavier_uniform_(feature_proj.weight)
-        with torch.no_grad():
-            data.x = feature_proj(data.x)
-        gat_in_channels = emb_dim
-    else:
-        feature_proj = None
-        gat_in_channels = in_channels
-
-    out_channels = mcfg["hidden_channels"]
-    encoder = GATEncoder(
-        in_channels=gat_in_channels,
-        hidden_channels=mcfg["hidden_channels"],
-        out_channels=out_channels,
-        num_layers=mcfg["num_layers"],
-        dropout=mcfg["dropout"],
-        attn_dropout=mcfg["attn_dropout"],
-        heads=mcfg["heads"],
-        use_gatv2=mcfg["use_gatv2"],
-        residual=mcfg["residual"],
-        layer_norm=mcfg["layer_norm"],
-        jk_mode=mcfg["jk_mode"],
-    ).to(device)
-
-    encoder_out_dim = encoder.out_dim
+    model = LinkPredictionGAT(
+        num_nodes=data.num_nodes,
+        input_channels=data.x.size(-1),
+        feature_channels=model_cfg["feature_channels"],
+        embedding_channels=model_cfg["node_embedding_channels"],
+        hidden_channels=model_cfg["hidden_channels"],
+        out_channels=model_cfg["out_channels"],
+        num_layers=model_cfg["num_layers"],
+        heads=model_cfg["heads"],
+        dropout=model_cfg["dropout"],
+        input_dropout=model_cfg["input_dropout"],
+        attention_dropout=model_cfg["attention_dropout"],
+        edge_dim=edge_dim,
+        gat_type=model_cfg["gat_type"],
+        residual=model_cfg["residual"],
+        norm=model_cfg["norm"],
+        jk=model_cfg["jk"],
+    )
     predictor = LinkPredictor(
-        encoder_out_dim,
-        pcfg["hidden_channels"],
-        1,
-        pcfg["num_layers"],
-        pcfg["dropout"],
-    ).to(device)
+        in_channels=model_cfg["out_channels"],
+        hidden_channels=predictor_cfg["hidden_channels"],
+        num_layers=predictor_cfg["num_layers"],
+        dropout=predictor_cfg["dropout"],
+        use_batch_norm=predictor_cfg["batch_norm"],
+        edge_feature_channels=edge_feature_channels,
+        edge_skip_weights=cfg.get("structural_features", {}).get("skip_weights"),
+        zero_output=predictor_cfg.get("zero_output", False),
+    )
+    return model, predictor
 
-    # Optional learnable node embeddings
-    node_emb = None
-    if cfg["node_embedding"]["use_embedding"]:
-        node_emb = torch.nn.Embedding(data.num_nodes, emb_dim).to(device)
-        torch.nn.init.xavier_uniform_(node_emb.weight)
 
-    ogb_evaluator = Evaluator(name=cfg["dataset"]["name"])
-    metrics = cfg["evaluation"]["metrics"]
+def build_scheduler(
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+) -> torch.optim.lr_scheduler.LambdaLR | None:
+    scheduler_cfg = cfg["scheduler"]
+    if scheduler_cfg.get("type", "cosine") == "none":
+        return None
 
-    # Logger
-    runs = cfg["experiment"]["runs"]
-    logger = Logger(runs, [f"Hits@{m.split('@')[1]}" for m in metrics])
+    total_epochs = cfg["training"]["epochs"]
+    warmup_epochs = scheduler_cfg.get("warmup_epochs", 0)
+    min_lr = scheduler_cfg.get("min_lr", 0.0)
+    base_lr = cfg["training"]["lr"]
 
-    print(f"\nModel: GATEncoder ({mcfg['num_layers']} layers, "
-          f"{mcfg['hidden_channels']}d, {mcfg['heads']} heads, "
-          f"{'GATv2' if mcfg['use_gatv2'] else 'GAT'})")
-    print(f"JK mode: {mcfg['jk_mode']}, Residual: {mcfg['residual']}, "
-          f"LayerNorm: {mcfg['layer_norm']}")
-    print(f"Predictor: {pcfg['num_layers']} layers, {pcfg['hidden_channels']}d")
-    if node_emb:
-        print(f"Node Embeddings: {emb_dim}d")
+    def lr_lambda(epoch: int) -> float:
+        step = epoch + 1
+        if warmup_epochs > 0 and step <= warmup_epochs:
+            return step / warmup_epochs
+        progress = (step - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        cosine = 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        return max(min_lr / base_lr, cosine)
 
-    total_params = (sum(p.numel() for p in encoder.parameters())
-                    + sum(p.numel() for p in predictor.parameters()))
-    if node_emb:
-        total_params += node_emb.weight.numel()
-    print(f"Total parameters: {total_params:,}\n")
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    # Training loop
-    es_cfg = cfg["early_stopping"]
-    tcfg = cfg["training"]
 
-    for run in range(runs):
-        set_seed(cfg["experiment"]["seed"] + run)
+def checkpoint_state(
+    model: LinkPredictionGAT,
+    predictor: LinkPredictor,
+    optimizer: torch.optim.Optimizer,
+    cfg: dict[str, Any],
+    run: int,
+    epoch: int,
+    results: dict[str, tuple[float, float, float]],
+) -> dict[str, Any]:
+    return {
+        "run": run,
+        "epoch": epoch,
+        "config": cfg,
+        "model": model.state_dict(),
+        "predictor": predictor.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "results": results,
+    }
 
-        encoder.reset_parameters()
-        predictor.reset_parameters()
-        if node_emb is not None:
-            torch.nn.init.xavier_uniform_(node_emb.weight)
 
-        # Build parameter groups
-        params = list(encoder.parameters()) + list(predictor.parameters())
-        if node_emb is not None:
-            params += list(node_emb.parameters())
+def select_device(exp_cfg: dict[str, Any]) -> torch.device:
+    accelerator = exp_cfg.get("accelerator", "auto")
+    if accelerator == "cpu":
+        return torch.device("cpu")
+    if accelerator == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA was requested but is not available.")
+        return torch.device(f"cuda:{exp_cfg.get('device', 0)}")
+    if accelerator == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("MPS was requested but is not available.")
+        return torch.device("mps")
+    if accelerator != "auto":
+        raise ValueError(f"Unsupported accelerator: {accelerator}")
 
-        optimizer = torch.optim.Adam(params, lr=tcfg["lr"],
-                                     weight_decay=tcfg["weight_decay"])
-        scheduler = get_cosine_schedule_with_warmup(
-            optimizer,
-            cfg["scheduler"]["warmup_epochs"],
-            tcfg["epochs"],
-            cfg["scheduler"]["min_lr"],
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{exp_cfg.get('device', 0)}")
+    return torch.device("cpu")
+
+
+def configure_torch_runtime(exp_cfg: dict[str, Any]) -> None:
+    precision = exp_cfg.get("matmul_precision")
+    if precision:
+        torch.set_float32_matmul_precision(precision)
+    if torch.cuda.is_available() and exp_cfg.get("allow_tf32", True):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+
+def device_name(device: torch.device) -> str:
+    if device.type == "cuda":
+        return torch.cuda.get_device_name(device)
+    if device.type == "mps":
+        return "Apple MPS"
+    return "CPU"
+
+
+def format_score(values: list[float]) -> str:
+    if not values:
+        return ""
+    scores = torch.tensor(values, dtype=torch.float) * 100
+    if scores.numel() == 1:
+        return f"{scores.item():.4f}"
+    return f"{scores.mean().item():.4f} +/- {scores.std(unbiased=False).item():.4f}"
+
+
+def write_result_sheet(
+    cfg: dict[str, Any],
+    logger: Logger,
+    total_params: int,
+    hardware: str,
+) -> None:
+    sheet_cfg = cfg.get("result_sheet", {})
+    if not sheet_cfg:
+        return
+
+    path = PROJECT_ROOT / sheet_cfg.get("path", "results/results.csv")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    monitor = "Hits@50" if "Hits@50" in logger.results else logger.monitor
+    best = []
+    for run in range(logger.runs):
+        item = logger.best_for_run(run, monitor)
+        if item["epoch_index"] >= 0:
+            best.append(item)
+    if not best:
+        return
+
+    row = {
+        "Method": sheet_cfg.get("method", "GATv2"),
+        "Ext. data": sheet_cfg.get("external_data", "No"),
+        "Test Hits@50": format_score([item["test_at_best_valid"] for item in best]),
+        "Validation Hits@50": format_score([item["best_valid"] for item in best]),
+        "#Params": str(total_params),
+        "Hardware": sheet_cfg.get("hardware") or hardware,
+        "Date": datetime.now().strftime("%Y-%m-%d"),
+    }
+
+    fieldnames = [
+        "Method",
+        "Ext. data",
+        "Test Hits@50",
+        "Validation Hits@50",
+        "#Params",
+        "Hardware",
+        "Date",
+    ]
+    write_header = not path.exists() or path.stat().st_size == 0
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    print(f"Result sheet updated: {path}")
+
+
+def build_structural_features(
+    cfg: dict[str, Any],
+    data,
+) -> tuple[StructuralFeatureStore | None, StructuralFeatureStore | None, int]:
+    structural_cfg = cfg.get("structural_features", {})
+    if not structural_cfg.get("enabled", False):
+        return None, None, 0
+
+    names = tuple(structural_cfg.get("features", ["cn", "aa", "ra", "jaccard", "pa"]))
+    print(f"Building structural link features: {', '.join(names)}")
+    train_store = StructuralFeatureStore.from_edge_index(
+        data.train_edge_index,
+        data.num_nodes,
+        feature_names=names,
+    )
+    full_store = StructuralFeatureStore.from_edge_index(
+        data.full_edge_index,
+        data.num_nodes,
+        feature_names=names,
+    )
+    return train_store, full_store, train_store.num_features
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = apply_overrides(load_config(args.config), args)
+    exp_cfg = cfg["experiment"]
+    train_cfg = cfg["training"]
+    eval_cfg = cfg["evaluation"]
+
+    configure_torch_runtime(exp_cfg)
+    set_seed(exp_cfg["seed"], deterministic=exp_cfg.get("deterministic", False))
+    device = select_device(exp_cfg)
+
+    print(f"Using device: {device}")
+    print("Loading ogbl-collab...")
+    data, split_edge, _ = load_dataset(cfg)
+    data = data.to(device)
+    train_structural_features, full_structural_features, edge_feature_channels = (
+        build_structural_features(cfg, data)
+    )
+    print(
+        f"Graph: {data.num_nodes:,} nodes, "
+        f"{data.train_edge_index.size(1):,} train message edges, "
+        f"{data.x.size(-1)} input features, edge_dim={data.edge_attr_dim}"
+    )
+
+    evaluator = Evaluator(name=cfg["dataset"]["name"])
+    metrics = [int(k) for k in eval_cfg["metrics"]]
+    monitor_k = int(cfg["early_stopping"]["monitor"].split("@")[1])
+    logger = Logger(exp_cfg["runs"], metrics, monitor=monitor_k)
+
+    checkpoint_dir = PROJECT_ROOT / exp_cfg["checkpoint_dir"]
+    log_dir = PROJECT_ROOT / exp_cfg["log_dir"]
+    if exp_cfg.get("save_checkpoints", True):
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    report_params = 0
+
+    for run in range(exp_cfg["runs"]):
+        run_seed = exp_cfg["seed"] + run
+        set_seed(run_seed, deterministic=exp_cfg.get("deterministic", False))
+
+        model, predictor = build_model(
+            cfg,
+            data,
+            edge_feature_channels=edge_feature_channels,
         )
+        model = model.to(device)
+        predictor = predictor.to(device)
+        model.reset_parameters()
+        predictor.reset_parameters()
 
-        best_valid = 0.0
-        patience_counter = 0
-        best_state = None
+        optimizer = torch.optim.AdamW(
+            list(model.parameters()) + list(predictor.parameters()),
+            lr=train_cfg["lr"],
+            weight_decay=train_cfg["weight_decay"],
+        )
+        scheduler = build_scheduler(optimizer, cfg)
+        negative_sampler = NegativeSampler.from_graph(
+            edge_index=data.train_edge_index.detach().cpu(),
+            num_nodes=data.num_nodes,
+            ratio=train_cfg["neg_sampling_ratio"],
+            mode=train_cfg["negative_sampler"],
+            degree_fraction=train_cfg["degree_negative_fraction"],
+        ).to(device)
 
-        for epoch in trange(1, 1 + tcfg["epochs"], desc=f"Run {run + 1}"):
-            loss = train_epoch(encoder, predictor, data, split_edge,
-                               optimizer, tcfg["batch_size"], node_emb)
-            logger.add_loss(run, loss)
-            scheduler.step()
+        best_valid = -1.0
+        patience = 0
+        best_path = checkpoint_dir / f"best_run{run + 1}.pt"
+        total_params = sum(p.numel() for p in model.parameters()) + sum(
+            p.numel() for p in predictor.parameters()
+        )
+        report_params = total_params
+        print(f"\nRun {run + 1}/{exp_cfg['runs']} | seed={run_seed} | params={total_params:,}")
 
-            if epoch % cfg["evaluation"]["eval_steps"] == 0:
-                results, _ = evaluate(
-                    encoder, predictor, data, split_edge,
-                    ogb_evaluator, tcfg["batch_size"], metrics, node_emb
+        if eval_cfg.get("eval_at_start", False):
+            results, _ = evaluate(
+                model=model,
+                predictor=predictor,
+                data=data,
+                split_edge=split_edge,
+                evaluator=evaluator,
+                batch_size=eval_cfg["batch_size"],
+                metrics=metrics,
+                max_train_edges=eval_cfg["max_train_edges"],
+                use_full_graph_for_test=eval_cfg["use_full_graph_for_test"],
+                train_structural_features=train_structural_features,
+                full_structural_features=full_structural_features,
+            )
+            lr = optimizer.param_groups[0]["lr"]
+            logger.add_result(run, 0, 0.0, lr, results)
+            monitor_name = f"Hits@{monitor_k}"
+            best_valid = results[monitor_name][1]
+            if exp_cfg.get("save_checkpoints", True):
+                torch.save(
+                    checkpoint_state(model, predictor, optimizer, cfg, run, 0, results),
+                    best_path,
                 )
-                logger.add_result(run, results)
+            metric_text = " | ".join(
+                f"{name}: train {100 * vals[0]:.2f} "
+                f"valid {100 * vals[1]:.2f} test {100 * vals[2]:.2f}"
+                for name, vals in results.items()
+            )
+            print(f"Run {run + 1:02d} Epoch 000 lr {lr:.2e} | {metric_text}")
 
-                if epoch % cfg["experiment"]["log_steps"] == 0:
-                    for key, (train_h, valid_h, test_h) in results.items():
-                        tqdm.write(
-                            f"Run {run+1:02d} | Epoch {epoch:03d} | "
-                            f"Loss {loss:.4f} | {key}: "
-                            f"Train {100*train_h:.2f}% "
-                            f"Valid {100*valid_h:.2f}% "
-                            f"Test {100*test_h:.2f}%"
-                        )
-                    tqdm.write(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
-                    tqdm.write("---")
+        for epoch in trange(1, train_cfg["epochs"] + 1, desc=f"run {run + 1}"):
+            loss = train_epoch(
+                model=model,
+                predictor=predictor,
+                data=data,
+                split_edge=split_edge,
+                optimizer=optimizer,
+                batch_size=train_cfg["batch_size"],
+                negative_sampler=negative_sampler,
+                grad_clip=train_cfg["grad_clip"],
+                encode_once=train_cfg["encode_once_per_epoch"],
+                structural_features=train_structural_features,
+            )
+            logger.add_loss(run, loss)
+            if scheduler is not None:
+                scheduler.step()
 
-                # Early stopping on monitored metric
-                monitor_key = f"Hits@{es_cfg['monitor'].split('@')[1]}"
-                if monitor_key in results:
-                    current_valid = results[monitor_key][1]
-                    if current_valid > best_valid:
-                        best_valid = current_valid
-                        patience_counter = 0
-                        if cfg["experiment"]["save_checkpoints"]:
-                            best_state = {
-                                "encoder": {k: v.cpu().clone() for k, v in encoder.state_dict().items()},
-                                "predictor": {k: v.cpu().clone() for k, v in predictor.state_dict().items()},
-                                "epoch": epoch,
-                                "valid_score": best_valid,
-                            }
-                            if node_emb is not None:
-                                best_state["node_emb"] = {k: v.cpu().clone() for k, v in node_emb.state_dict().items()}
-                    else:
-                        patience_counter += 1
+            if epoch % eval_cfg["eval_steps"] != 0:
+                continue
 
-                    if es_cfg["enabled"] and patience_counter >= es_cfg["patience"]:
-                        tqdm.write(
-                            f"Early stopping at epoch {epoch} "
-                            f"(best valid {monitor_key}: {100*best_valid:.2f}%)"
-                        )
-                        break
+            results, _ = evaluate(
+                model=model,
+                predictor=predictor,
+                data=data,
+                split_edge=split_edge,
+                evaluator=evaluator,
+                batch_size=eval_cfg["batch_size"],
+                metrics=metrics,
+                max_train_edges=eval_cfg["max_train_edges"],
+                use_full_graph_for_test=eval_cfg["use_full_graph_for_test"],
+                train_structural_features=train_structural_features,
+                full_structural_features=full_structural_features,
+            )
+            lr = optimizer.param_groups[0]["lr"]
+            logger.add_result(run, epoch, loss, lr, results)
 
-        # Save best checkpoint
-        if best_state is not None and cfg["experiment"]["save_checkpoints"]:
-            ckpt_dir = cfg["experiment"]["checkpoint_dir"]
-            os.makedirs(ckpt_dir, exist_ok=True)
-            ckpt_path = os.path.join(ckpt_dir, f"best_run{run+1}.pt")
-            torch.save(best_state, ckpt_path)
-            tqdm.write(f"Saved checkpoint: {ckpt_path}")
+            monitor_name = f"Hits@{monitor_k}"
+            current_valid = results[monitor_name][1]
+            if current_valid > best_valid:
+                best_valid = current_valid
+                patience = 0
+                if exp_cfg.get("save_checkpoints", True):
+                    torch.save(
+                        checkpoint_state(model, predictor, optimizer, cfg, run, epoch, results),
+                        best_path,
+                    )
+            else:
+                patience += 1
 
-        for metric_key in logger.results:
-            logger.print_statistics(run, metric=metric_key)
+            if epoch % exp_cfg["log_steps"] == 0:
+                metric_text = " | ".join(
+                    f"{name}: train {100 * vals[0]:.2f} "
+                    f"valid {100 * vals[1]:.2f} test {100 * vals[2]:.2f}"
+                    for name, vals in results.items()
+                )
+                print(
+                    f"Run {run + 1:02d} Epoch {epoch:03d} "
+                    f"loss {loss:.4f} lr {lr:.2e} | {metric_text}"
+                )
 
-    # Final summary
-    print("\n" + "=" * 60)
-    print("FINAL RESULTS")
-    print("=" * 60)
-    for metric_key in logger.results:
-        logger.print_statistics(metric=metric_key)
+            early_cfg = cfg["early_stopping"]
+            if early_cfg["enabled"] and patience >= early_cfg["patience"]:
+                print(
+                    f"Early stopping run {run + 1} at epoch {epoch}; "
+                    f"best valid {monitor_name}={100 * best_valid:.2f}%"
+                )
+                break
 
-    # Export training logs
-    log_dir = cfg["experiment"]["log_dir"]
-    os.makedirs(log_dir, exist_ok=True)
-    logger.export_json(os.path.join(log_dir, "training_log.json"))
-    print(f"\nTraining logs saved to {log_dir}/training_log.json")
+        logger.print_run(run, f"Hits@{monitor_k}")
 
-    # Save config used
-    with open(os.path.join(log_dir, "config_used.yaml"), "w") as f:
-        yaml.dump(cfg, f, default_flow_style=False)
+    print("\nFinal summary")
+    for k in metrics:
+        logger.print_summary(f"Hits@{k}")
+
+    logger.export_json(str(log_dir / "training_log.json"))
+    with open(log_dir / "config_used.yaml", "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False)
+    print(f"Logs written to {log_dir}")
+    write_result_sheet(cfg, logger, report_params, device_name(device))
 
 
 if __name__ == "__main__":

@@ -1,155 +1,127 @@
+from __future__ import annotations
+
+from typing import Literal
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GATConv, GATv2Conv
+from torch_geometric.nn import GATConv, GATv2Conv, JumpingKnowledge
+
+
+NormName = Literal["batch", "layer", "none"]
+GATName = Literal["gat", "gatv2"]
+JKName = Literal["cat", "max", "lstm", "last"]
 
 
 class GATEncoder(nn.Module):
-    """
-    Enhanced GAT encoder with:
-    - GATv2Conv (dynamic attention) or standard GATConv
-    - Residual (skip) connections
-    - Layer normalization
-    - Jumping Knowledge aggregation (cat, max, last)
-    - Learnable node embeddings for featureless graphs
+    """Edge-aware GAT encoder for ogbl-collab link prediction.
+
+    ``hidden_channels`` is interpreted as the total width of each hidden layer,
+    not the width per attention head.  For example, ``hidden_channels=256`` and
+    ``heads=4`` creates four 64-dimensional heads whose outputs are concatenated
+    back to 256 dimensions.
     """
 
     def __init__(
         self,
-        in_channels,
-        hidden_channels,
-        out_channels,
-        num_layers,
-        dropout=0.3,
-        attn_dropout=0.1,
-        heads=4,
-        use_gatv2=True,
-        residual=True,
-        layer_norm=True,
-        jk_mode="cat",
-    ):
+        in_channels: int,
+        hidden_channels: int,
+        out_channels: int,
+        num_layers: int,
+        heads: int = 4,
+        dropout: float = 0.2,
+        attention_dropout: float = 0.1,
+        edge_dim: int | None = None,
+        gat_type: GATName = "gatv2",
+        residual: bool = True,
+        norm: NormName = "layer",
+        jk: JKName = "cat",
+    ) -> None:
         super().__init__()
+        if num_layers < 1:
+            raise ValueError("num_layers must be at least 1.")
+        if hidden_channels % heads != 0:
+            raise ValueError("hidden_channels must be divisible by heads.")
+        if jk not in {"cat", "max", "lstm", "last"}:
+            raise ValueError(f"Unsupported Jumping Knowledge mode: {jk}")
 
-        self.num_layers = num_layers
         self.dropout = dropout
         self.residual = residual
-        self.use_layer_norm = layer_norm
-        self.jk_mode = jk_mode
+        self.jk_mode = jk
+        self.out_channels = out_channels
 
-        ConvLayer = GATv2Conv if use_gatv2 else GATConv
+        conv_cls = GATv2Conv if gat_type == "gatv2" else GATConv
+        head_channels = hidden_channels // heads
 
+        self.input_proj = nn.Linear(in_channels, hidden_channels)
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
-        self.skip_lins = nn.ModuleList()
+        self.skips = nn.ModuleList()
 
-        # First layer
-        self.convs.append(
-            ConvLayer(
-                in_channels,
-                hidden_channels,
-                heads=heads,
-                dropout=attn_dropout,
-                concat=True,
-            )
-        )
-        self.norms.append(nn.LayerNorm(hidden_channels * heads))
-        self.skip_lins.append(nn.Linear(in_channels, hidden_channels * heads))
-
-        # Middle layers
-        for _ in range(num_layers - 2):
+        for _ in range(num_layers):
             self.convs.append(
-                ConvLayer(
-                    hidden_channels * heads,
+                conv_cls(
                     hidden_channels,
+                    head_channels,
                     heads=heads,
-                    dropout=attn_dropout,
                     concat=True,
+                    dropout=attention_dropout,
+                    edge_dim=edge_dim,
+                    add_self_loops=False,
                 )
             )
-            self.norms.append(nn.LayerNorm(hidden_channels * heads))
-            self.skip_lins.append(
-                nn.Linear(hidden_channels * heads, hidden_channels * heads)
-            )
+            self.norms.append(_make_norm(norm, hidden_channels))
+            self.skips.append(nn.Identity())
 
-        # Last layer
-        self.convs.append(
-            ConvLayer(
-                hidden_channels * heads,
-                out_channels,
-                heads=heads,
-                dropout=attn_dropout,
-                concat=True,
-            )
+        self.jk = (
+            nn.Identity()
+            if jk == "last"
+            else JumpingKnowledge(jk, channels=hidden_channels, num_layers=num_layers)
         )
-        self.norms.append(nn.LayerNorm(out_channels * heads))
-        self.skip_lins.append(
-            nn.Linear(hidden_channels * heads, out_channels * heads)
-        )
+        jk_channels = hidden_channels * num_layers if jk == "cat" else hidden_channels
+        self.output_proj = nn.Linear(jk_channels, out_channels)
 
-        # Jumping Knowledge projection
-        if jk_mode == "cat":
-            self.jk_lin = nn.Linear(
-                out_channels * heads * num_layers, out_channels * heads
-            )
-        elif jk_mode == "max":
-            # All intermediate representations must have the same dim
-            # We project each layer to the final dim
-            self.jk_projs = nn.ModuleList()
-            for i in range(num_layers - 1):
-                self.jk_projs.append(
-                    nn.Linear(hidden_channels * heads, out_channels * heads)
-                )
-            self.jk_projs.append(nn.Identity())
-        # jk_mode == "last" needs no extra parameters
-
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        self.input_proj.reset_parameters()
         for conv in self.convs:
             conv.reset_parameters()
         for norm in self.norms:
-            norm.reset_parameters()
-        for lin in self.skip_lins:
-            lin.reset_parameters()
-        if self.jk_mode == "cat":
-            self.jk_lin.reset_parameters()
-        elif self.jk_mode == "max":
-            for proj in self.jk_projs:
-                if hasattr(proj, "reset_parameters"):
-                    proj.reset_parameters()
+            if hasattr(norm, "reset_parameters"):
+                norm.reset_parameters()
+        if hasattr(self.jk, "reset_parameters"):
+            self.jk.reset_parameters()
+        self.output_proj.reset_parameters()
 
-    def forward(self, x, adj_t):
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_attr: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self.input_proj(x)
         layer_outputs = []
 
-        for i in range(self.num_layers):
-            x_in = x
-            x = self.convs[i](x, adj_t)
-
-            if self.use_layer_norm:
-                x = self.norms[i](x)
-
-            if i < self.num_layers - 1:
-                x = F.elu(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
-
+        for conv, norm, skip in zip(self.convs, self.norms, self.skips):
+            residual = skip(x)
+            out = conv(x, edge_index, edge_attr=edge_attr)
             if self.residual:
-                x = x + self.skip_lins[i](x_in)
-
+                out = out + residual
+            out = norm(out)
+            out = F.elu(out)
+            out = F.dropout(out, p=self.dropout, training=self.training)
+            x = out
             layer_outputs.append(x)
 
-        # Jumping Knowledge aggregation
-        if self.jk_mode == "cat":
-            x = torch.cat(layer_outputs, dim=-1)
-            x = self.jk_lin(x)
-        elif self.jk_mode == "max":
-            projected = [
-                self.jk_projs[i](layer_outputs[i])
-                for i in range(self.num_layers)
-            ]
-            x = torch.stack(projected, dim=0).max(dim=0)[0]
-        else:  # "last"
-            x = layer_outputs[-1]
-
+        x = layer_outputs[-1] if self.jk_mode == "last" else self.jk(layer_outputs)
+        x = self.output_proj(x)
         return x
 
-    @property
-    def out_dim(self):
-        return self.convs[-1].out_channels * self.convs[-1].heads
+
+def _make_norm(name: NormName, channels: int) -> nn.Module:
+    if name == "batch":
+        return nn.BatchNorm1d(channels)
+    if name == "layer":
+        return nn.LayerNorm(channels)
+    if name == "none":
+        return nn.Identity()
+    raise ValueError(f"Unsupported normalization: {name}")

@@ -1,78 +1,102 @@
+from __future__ import annotations
+
 import json
 import os
 from collections import defaultdict
+from typing import Any
 
 import torch
 
 
 class Logger:
-    """Training logger that tracks metrics across runs and supports JSON export."""
+    """Run logger for OGB Hits@K metrics."""
 
-    def __init__(self, runs, metrics):
+    def __init__(self, runs: int, metrics: list[int], monitor: int = 50) -> None:
         self.runs = runs
-        self.metrics = metrics
-        self.results = {m: [[] for _ in range(runs)] for m in metrics}
-        self.train_losses = [[] for _ in range(runs)]
-
-    def add_result(self, run, results_dict):
-        for metric, values in results_dict.items():
-            assert len(values) == 3  # (train, valid, test)
-            self.results[metric][run].append(values)
-
-    def add_loss(self, run, loss):
-        self.train_losses[run].append(loss)
-
-    def print_statistics(self, run=None, metric="Hits@50"):
-        if metric not in self.results:
-            return
-        if run is not None:
-            result = 100 * torch.tensor(self.results[metric][run])
-            print(f"Run {run + 1:02d} [{metric}]:")
-            print(f"  Best Valid: {result[:, 1].max():.2f}")
-            idx = result[:, 1].argmax()
-            print(f"  Test @ Best Valid: {result[idx, 2]:.2f}")
-        else:
-            result = 100 * torch.tensor(self.results[metric])
-            best_results = []
-            for r in result:
-                valid = r[:, 1]
-                test = r[:, 2]
-                best_val = valid.max().item()
-                best_test = test[valid.argmax()].item()
-                best_results.append((best_val, best_test))
-            best_val = torch.tensor(best_results)[:, 0]
-            best_test = torch.tensor(best_results)[:, 1]
-            print(f"All Runs [{metric}]:")
-            print(f"  Valid: {best_val.mean():.2f} +/- {best_val.std():.2f}")
-            print(f"  Test:  {best_test.mean():.2f} +/- {best_test.std():.2f}")
-
-    def get_best_results(self, metric="Hits@50"):
-        """Return per-run best valid and corresponding test scores."""
-        result = 100 * torch.tensor(self.results[metric])
-        bests = []
-        for r in result:
-            valid = r[:, 1]
-            test = r[:, 2]
-            idx = valid.argmax()
-            bests.append({
-                "best_valid": valid[idx].item(),
-                "test_at_best_valid": test[idx].item(),
-                "best_epoch_idx": idx.item(),
-            })
-        return bests
-
-    def export_json(self, path):
-        """Export all logged data to JSON for visualization."""
-        export = {
-            "losses": [losses for losses in self.train_losses],
-            "metrics": {},
+        self.metric_names = [f"Hits@{int(k)}" for k in metrics]
+        self.monitor = f"Hits@{int(monitor)}"
+        self.results: dict[str, list[list[tuple[float, float, float]]]] = {
+            name: [[] for _ in range(runs)] for name in self.metric_names
         }
-        for metric in self.metrics:
-            export["metrics"][metric] = []
-            for run_data in self.results[metric]:
-                export["metrics"][metric].append(
-                    [list(v) for v in run_data]
-                )
-        os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        with open(path, "w") as f:
+        self.losses: list[list[float]] = [[] for _ in range(runs)]
+        self.records: list[list[dict[str, Any]]] = [[] for _ in range(runs)]
+
+    def add_loss(self, run: int, loss: float) -> None:
+        self.losses[run].append(float(loss))
+
+    def add_result(
+        self,
+        run: int,
+        epoch: int,
+        loss: float,
+        lr: float,
+        results: dict[str, tuple[float, float, float]],
+    ) -> None:
+        record = {"epoch": epoch, "loss": float(loss), "lr": float(lr), "metrics": {}}
+        for name, values in results.items():
+            values = tuple(float(v) for v in values)
+            self.results[name][run].append(values)
+            record["metrics"][name] = {
+                "train": values[0],
+                "valid": values[1],
+                "test": values[2],
+            }
+        self.records[run].append(record)
+
+    def best_for_run(self, run: int, metric: str | None = None) -> dict[str, float]:
+        metric = metric or self.monitor
+        values = self.results[metric][run]
+        if not values:
+            return {"best_valid": 0.0, "test_at_best_valid": 0.0, "epoch_index": -1}
+        result = torch.tensor(values)
+        valid = result[:, 1]
+        best_idx = int(valid.argmax().item())
+        return {
+            "best_valid": float(result[best_idx, 1].item()),
+            "test_at_best_valid": float(result[best_idx, 2].item()),
+            "epoch_index": best_idx,
+        }
+
+    def print_run(self, run: int, metric: str | None = None) -> None:
+        metric = metric or self.monitor
+        best = self.best_for_run(run, metric)
+        print(
+            f"Run {run + 1:02d} [{metric}] | "
+            f"Best valid: {100 * best['best_valid']:.2f}% | "
+            f"Test at best valid: {100 * best['test_at_best_valid']:.2f}%"
+        )
+
+    def print_summary(self, metric: str | None = None) -> None:
+        metric = metric or self.monitor
+        best = [self.best_for_run(run, metric) for run in range(self.runs)]
+        best = [item for item in best if item["epoch_index"] >= 0]
+        if not best:
+            print(f"No evaluation records for {metric}.")
+            return
+        valid = torch.tensor([item["best_valid"] for item in best]) * 100
+        test = torch.tensor([item["test_at_best_valid"] for item in best]) * 100
+        valid_std = valid.std(unbiased=False).item() if valid.numel() > 1 else 0.0
+        test_std = test.std(unbiased=False).item() if test.numel() > 1 else 0.0
+        print(
+            f"All runs [{metric}] | "
+            f"Valid: {valid.mean():.2f} +/- {valid_std:.2f} | "
+            f"Test: {test.mean():.2f} +/- {test_std:.2f}"
+        )
+
+    def export_json(self, path: str) -> None:
+        export = {
+            "losses": self.losses,
+            "records": self.records,
+            "best": defaultdict(list),
+        }
+        for metric in self.metric_names:
+            export["best"][metric] = [
+                self.best_for_run(run, metric) for run in range(self.runs)
+            ]
+        export["best"] = dict(export["best"])
+
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(export, f, indent=2)
